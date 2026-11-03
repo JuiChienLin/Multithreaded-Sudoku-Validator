@@ -1,0 +1,12 @@
+# Compiled executable
+sudoku_validator
+
+# Object files
+*.o
+
+# macOS
+.DS_Store
+
+# Editor temporary files
+*.swp
+*.swo
