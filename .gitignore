@@ -10,3 +10,4 @@ sudoku_validator
 # Editor temporary files
 *.swp
 *.swo
+*.bak

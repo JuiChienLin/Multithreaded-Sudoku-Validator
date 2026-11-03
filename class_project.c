@@ -1,261 +1,247 @@
-// 判斷一個 9x9 數獨棋盤是否為有效解答
-// 使用多執行緒來同時檢查列、行及 3x3 子區塊
-#include <stdio.h>
-#include <stdlib.h>
+#include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 
 #define SIZE 9
-#define NUM_THREADS 11   // 0: rows, 1: columns, 2~10: subgrids
+#define SUBGRID_SIZE 3
+#define NUM_THREADS 11
+#define FIRST_SUBGRID_THREAD 2
 
-/* ========= 9x9 數獨棋盤 ========= */
-int sudoku[SIZE][SIZE] = {
-    {6,2,4,5,3,9,1,8,7},
-    {5,1,9,7,2,8,6,3,4},
-    {8,3,7,6,1,4,2,9,5},
-    {1,4,3,8,6,5,7,2,9},
-    {9,5,8,2,4,7,3,6,1},
-    {7,6,2,3,9,1,4,5,8},
-    {3,7,1,9,5,6,8,4,2},  
-    {4,9,6,1,8,2,5,4,3},
-    {2,8,5,4,7,3,9,1,5}   
-};/* Load a 9x9 Sudoku board from a text file. */
-int load_sudoku(const char *filename) {
-    FILE *fp = fopen(filename, "r");
+/* The board is loaded before any worker thread is started. */
+static int sudoku[SIZE][SIZE];
 
-    if (fp == NULL) {
+/* Each worker writes only to its own result slot. */
+static int results[NUM_THREADS];
+static int error_unit[NUM_THREADS];
+
+typedef struct {
+    int row;
+    int column;
+    int index;
+} ThreadParams;
+
+/* Read exactly SIZE * SIZE integers from the input file. */
+static int load_sudoku(const char *filename)
+{
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
         perror(filename);
         return -1;
     }
 
     int board[SIZE][SIZE];
 
-    for (int r = 0; r < SIZE; r++) {
-        for (int c = 0; c < SIZE; c++) {
-            if (fscanf(fp, "%d", &board[r][c]) != 1) {
+    for (int row = 0; row < SIZE; row++) {
+        for (int column = 0; column < SIZE; column++) {
+            if (fscanf(file, "%d", &board[row][column]) != 1) {
                 fprintf(stderr,
                         "Invalid Sudoku input at row %d, column %d\n",
-                        r + 1, c + 1);
-                fclose(fp);
+                        row + 1, column + 1);
+                fclose(file);
                 return -1;
             }
         }
     }
 
-    /* Reject extra data after the 81 integers. */
+    /* Reject any non-whitespace content after the board. */
     char extra;
-    if (fscanf(fp, " %c", &extra) == 1) {
+    int scan_result = fscanf(file, " %c", &extra);
+    if (scan_result == 1) {
         fprintf(stderr, "Invalid input: extra data after Sudoku board\n");
-        fclose(fp);
+        fclose(file);
         return -1;
     }
-
-    if (ferror(fp)) {
-        fprintf(stderr, "Error reading Sudoku file\n");
-        fclose(fp);
+    if (ferror(file)) {
+        fprintf(stderr, "Error reading Sudoku file: %s\n", strerror(errno));
+        fclose(file);
         return -1;
     }
-
-    fclose(fp);
+    if (fclose(file) == EOF) {
+        perror("fclose");
+        return -1;
+    }
 
     memcpy(sudoku, board, sizeof(board));
     return 0;
 }
 
-/* ========= 各 thread 檢查結果 ========= */
-int results[NUM_THREADS];      // 1 = OK, 0 = FAIL
-int error_unit[NUM_THREADS];   // 出錯的 row 編號
+/* Validate all rows. */
+static void *check_rows(void *argument)
+{
+    const ThreadParams *params = argument;
 
-/* ========= 傳遞給 thread 的參數 ========= */
-typedef struct { 
-    int row;
-    int column;
-    int index;   // results[] 和 error_unit[] 的索引
-} parameters;
-
-/* ========= 檢查所有 rows ========= */
-void *check_rows(void *param) {
-    parameters *data = (parameters *)param;
-
-    for (int r = 0; r < SIZE; r++) {    // 檢查共九列
+    for (int row = 0; row < SIZE; row++) {
         int used[SIZE] = {0};
-        for (int c = 0; c < SIZE; c++) {
-            int num = sudoku[r][c];
-            if (num < 1 || num > 9 || used[num - 1]) { // 重複或不在 1~9 範圍內
-                results[data->index] = 0;
-                error_unit[data->index] = r;   // 第 r 列出錯
-                pthread_exit(NULL);   // 提早結束 thread
+
+        for (int column = 0; column < SIZE; column++) {
+            int value = sudoku[row][column];
+            if (value < 1 || value > SIZE || used[value - 1]) {
+                results[params->index] = 0;
+                error_unit[params->index] = row;
+                return NULL;
             }
-            used[num - 1] = 1; //若沒問題，標記該數字已出現過
+            used[value - 1] = 1;
         }
     }
 
-    results[data->index] = 1; // 全部九列皆通過檢查, results 設為 1
-    pthread_exit(NULL);
+    results[params->index] = 1;
+    return NULL;
 }
 
-/* ========= 檢查所有 columns ========= */
-void *check_columns(void *param) {
-    parameters *data = (parameters *)param;
+/* Validate all columns. */
+static void *check_columns(void *argument)
+{
+    const ThreadParams *params = argument;
 
-    for (int c = 0; c < SIZE; c++) {
+    for (int column = 0; column < SIZE; column++) {
         int used[SIZE] = {0};
-        for (int r = 0; r < SIZE; r++) {
-            int num = sudoku[r][c];
-           if (num < 1 || num > 9 || used[num - 1]) {
-                results[data->index] = 0;
-                error_unit[data->index] = c;
-                pthread_exit(NULL);
+
+        for (int row = 0; row < SIZE; row++) {
+            int value = sudoku[row][column];
+            if (value < 1 || value > SIZE || used[value - 1]) {
+                results[params->index] = 0;
+                error_unit[params->index] = column;
+                return NULL;
             }
-            used[num - 1] = 1;
+            used[value - 1] = 1;
         }
     }
 
-    results[data->index] = 1;
-    pthread_exit(NULL);
+    results[params->index] = 1;
+    return NULL;
 }
 
-/* ========= 檢查單一 3x3 subgrid ========= */
-void *check_subgrid(void *param) {
-    parameters *data = (parameters *)param;
+/* Validate one 3x3 subgrid. */
+static void *check_subgrid(void *argument)
+{
+    const ThreadParams *params = argument;
     int used[SIZE] = {0};
 
-    for (int i = 0; i < 3; i++) {  
-        for (int j = 0; j < 3; j++) {
-            int num = sudoku[data->row + i][data->column + j];
-            if (num < 1 || num > 9 || used[num - 1]) {
-                results[data->index] = 0;
-                error_unit[data->index] = data->index - 2;
-                pthread_exit(NULL);
+    for (int row = 0; row < SUBGRID_SIZE; row++) {
+        for (int column = 0; column < SUBGRID_SIZE; column++) {
+            int value = sudoku[params->row + row][params->column + column];
+            if (value < 1 || value > SIZE || used[value - 1]) {
+                results[params->index] = 0;
+                error_unit[params->index] = params->index - FIRST_SUBGRID_THREAD;
+                return NULL;
             }
-            used[num - 1] = 1;
+            used[value - 1] = 1;
         }
     }
 
-    results[data->index] = 1;
-    pthread_exit(NULL);
+    results[params->index] = 1;
+    return NULL;
 }
 
-int create_thread(pthread_t *thread,
-                  void *(*function)(void *),
-                  void *argument)
+static int create_thread(pthread_t *thread,
+                         void *(*worker)(void *),
+                         void *argument)
 {
-    int ret = pthread_create(thread, NULL, function, argument);
-
-    if (ret != 0) {
-        fprintf(stderr, "pthread_create failed: %s\n", strerror(ret));
+    int error = pthread_create(thread, NULL, worker, argument);
+    if (error != 0) {
+        fprintf(stderr, "pthread_create failed: %s\n", strerror(error));
     }
-
-    return ret;
+    return error;
 }
-/* ========= 主程式 ========= */
 
-int main(int argc, char *argv[]) {
+static void print_failure(int index)
+{
+    puts("Sudoku solution is INVALID");
+
+    if (index == 0) {
+        printf("Row check failed at row %d\n", error_unit[index] + 1);
+    } else if (index == 1) {
+        printf("Column check failed at column %d\n", error_unit[index] + 1);
+    } else {
+        int grid = error_unit[index];
+        int first_row = (grid / SUBGRID_SIZE) * SUBGRID_SIZE + 1;
+        int first_column = (grid % SUBGRID_SIZE) * SUBGRID_SIZE + 1;
+
+        printf("Subgrid check failed at subgrid %d "
+               "(rows %d-%d, columns %d-%d)\n",
+               grid + 1,
+               first_row, first_row + SUBGRID_SIZE - 1,
+               first_column, first_column + SUBGRID_SIZE - 1);
+    }
+}
+
+int main(int argc, char *argv[])
+{
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <sudoku-file>\n", argv[0]);
         return 1;
     }
-
     if (load_sudoku(argv[1]) != 0) {
         return 1;
     }
-    pthread_t threads[NUM_THREADS];
-    parameters params[NUM_THREADS] = {0};
-    int thread_id = 0;
-    int failed = 0;
 
-    // Initialize shared results.
+    pthread_t threads[NUM_THREADS];
+    ThreadParams params[NUM_THREADS] = {0};
+    int created_count = 0;
+    int thread_failed = 0;
+
     for (int i = 0; i < NUM_THREADS; i++) {
-        results[i] = 1;
         error_unit[i] = -1;
     }
 
-    /* --- rows --- */
-    params[thread_id].index = thread_id;
-
-    if (create_thread(&threads[thread_id],
-                      check_rows,
-                      &params[thread_id]) != 0) {
-        failed = 1;
+    /* Thread 0 checks all rows. */
+    params[created_count].index = created_count;
+    if (create_thread(&threads[created_count], check_rows,
+                      &params[created_count]) != 0) {
+        thread_failed = 1;
         goto join_threads;
     }
-    thread_id++;
+    created_count++;
 
-    /* --- columns --- */
-    params[thread_id].index = thread_id;
-
-    if (create_thread(&threads[thread_id],
-                      check_columns,
-                      &params[thread_id]) != 0) {
-        failed = 1;
+    /* Thread 1 checks all columns. */
+    params[created_count].index = created_count;
+    if (create_thread(&threads[created_count], check_columns,
+                      &params[created_count]) != 0) {
+        thread_failed = 1;
         goto join_threads;
     }
-    thread_id++;
+    created_count++;
 
-    /* --- subgrids --- */
-    for (int r = 0; r < SIZE; r += 3) {
-        for (int c = 0; c < SIZE; c += 3) {
-            params[thread_id].row = r;
-            params[thread_id].column = c;
-            params[thread_id].index = thread_id;
+    /* Threads 2 through 10 each check one subgrid. */
+    for (int row = 0; row < SIZE; row += SUBGRID_SIZE) {
+        for (int column = 0; column < SIZE; column += SUBGRID_SIZE) {
+            params[created_count].row = row;
+            params[created_count].column = column;
+            params[created_count].index = created_count;
 
-            if (create_thread(&threads[thread_id],
-                              check_subgrid,
-                              &params[thread_id]) != 0) {
-                failed = 1;
+            if (create_thread(&threads[created_count], check_subgrid,
+                              &params[created_count]) != 0) {
+                thread_failed = 1;
                 goto join_threads;
             }
-            thread_id++;
+            created_count++;
         }
     }
 
 join_threads:
-    // Join only successfully created threads.
-    for (int i = 0; i < thread_id; i++) {
-        int ret = pthread_join(threads[i], NULL);
-
-        if (ret != 0) {
-            fprintf(stderr, "pthread_join failed: %s\n",
-                    strerror(ret));
-            failed = 1;
+    /* Only join successfully created threads. */
+    for (int i = 0; i < created_count; i++) {
+        int error = pthread_join(threads[i], NULL);
+        if (error != 0) {
+            fprintf(stderr, "pthread_join failed: %s\n", strerror(error));
+            thread_failed = 1;
         }
     }
 
-    if (failed) {
-        fprintf(stderr, "Thread execution failed.\n");
+    if (thread_failed) {
+        fputs("Thread execution failed.\n", stderr);
         return 1;
     }
 
-    /* --- Check validation results --- */
+    /* Report the first failure in worker index order. */
     for (int i = 0; i < NUM_THREADS; i++) {
         if (results[i] == 0) {
-            printf("Sudoku solution is INVALID ❌\n");
-
-            if (i == 0) {
-                printf("Row check failed at row %d\n",
-                    error_unit[i] + 1);
-
-            } else if (i == 1) {
-                printf("Column check failed at column %d\n",
-                    error_unit[i] + 1);
-
-            } else {
-                int grid = error_unit[i];
-
-                int start_row = (grid / 3) * 3 + 1;
-                int start_col = (grid % 3) * 3 + 1;
-
-                printf("Subgrid check failed at subgrid %d "
-                    "(rows %d-%d, columns %d-%d)\n",
-                    grid + 1,
-                    start_row, start_row + 2,
-                    start_col, start_col + 2);
-            }
-
+            print_failure(i);
             return 1;
         }
     }
 
-    printf("Sudoku solution is VALID ✅\n");
+    puts("Sudoku solution is VALID");
     return 0;
 }
